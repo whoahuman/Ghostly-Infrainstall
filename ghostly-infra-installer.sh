@@ -1,34 +1,7 @@
 #!/usr/bin/env bash
-# ==============================================================================
-#   ██████╗ ██╗  ██╗ ██████╗ ███████╗████████╗██╗  ██╗   ██╗   ██╗
-#  ██╔════╝ ██║  ██║██╔═══██╗██╔════╝╚══██╔══╝██║  ██║   ╚██╗ ██╔╝
-#  ██║  ███╗███████║██║   ██║███████╗   ██║   ███████║    ╚████╔╝
-#  ██║   ██║██╔══██║██║   ██║╚════██║   ██║   ██╔══██║     ╚██╔╝
-#  ╚██████╔╝██║  ██║╚██████╔╝███████║   ██║   ██║  ██║      ██║
-#   ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝   ╚═╝  ╚═╝      ╚═╝
-#
-#  Ghostly Infra-installer — установка и защита Remnawave Node
-#  Версия: 1.0.1
-#
-#  Что делает:
-#    1. Тюнинг ядра (BBR + fq, безопасные sysctl, без слепой правки conntrack)
-#    2. Firewall (nftables): NODE_PORT только для панели, анти-флуд,
-#       анти-скан, опционально строгий режим (policy DROP)
-#    3. Docker + ротация логов Docker
-#    4. Let's Encrypt (acme.sh): HTTP-01 standalone или DNS-01 Cloudflare
-#    5. Remnawave Node (docker compose) с доступом к сертификатам и логам
-#    6. Ротация логов ноды, journald
-#    7. Опционально: fail2ban (SSH), CrowdSec (анти-скан/ботнеты),
-#       харденинг SSH, сниппет анти-торрент для Config Profile
-#
-#  Запуск:  sudo bash ghostly-infra-installer.sh
-#  Справка: sudo bash ghostly-infra-installer.sh --help
-#
-#  Повторный запуск безопасен: берёт параметры из /etc/ghostly/config.env
-# ==============================================================================
 set -Eeuo pipefail
 
-readonly VERSION="1.0.1"
+readonly VERSION="1.0.3"
 readonly APP="Ghostly Infra-installer"
 
 CONFIG_DIR="/etc/ghostly"
@@ -783,32 +756,40 @@ step_certs() {
 
   mkdir -p "$CERT_DIR"
   local reloadcmd
-  reloadcmd="chmod 600 ${CERT_DIR}/privkey.key; chmod 644 ${CERT_DIR}/fullchain.pem; docker restart remnanode >/dev/null 2>&1 || true"
+  reloadcmd="chmod 600 ${CERT_DIR}/privkey.key; chmod 644 ${CERT_DIR}/fullchain.pem; ln -sf privkey.key ${CERT_DIR}/privkey.pem; ln -sf fullchain.pem ${CERT_DIR}/cert.pem; docker restart remnanode >/dev/null 2>&1 || true"
 
-  local rc=0
+  local rc_issue=0
   if [[ "$ACME_METHOD" == "dns_cf" ]]; then
     if [[ -z "${CF_TOKEN:-}" ]]; then
       warn "CF_TOKEN пуст — пропускаю выпуск. Позже: CF_Token=<token> $ACME_SH --issue --dns dns_cf -d $DOMAIN --keylength ec-256"
       return 0
     fi
     export CF_Token="$CF_TOKEN"
-    "$ACME_SH" --issue --dns dns_cf -d "$DOMAIN" --keylength ec-256 || rc=1
+    "$ACME_SH" --issue --dns dns_cf -d "$DOMAIN" --keylength ec-256 || rc_issue=$?
   else
     if ss -lntH 2>/dev/null | awk '{print $4}' | grep -qE '(:80)$'; then
       warn "Порт 80 занят — HTTP-01 standalone не пройдёт (варианты: освободить 80 или --acme dns_cf)"
     fi
-    "$ACME_SH" --issue --standalone -d "$DOMAIN" --keylength ec-256 || rc=1
+    "$ACME_SH" --issue --standalone -d "$DOMAIN" --keylength ec-256 || rc_issue=$?
   fi
 
-  if (( rc == 0 )); then
+  # acme.sh: 0 = выпущен сейчас, 2 = уже есть и не требует продления (это норма при повторном запуске)
+  if (( rc_issue == 0 || rc_issue == 2 )); then
     "$ACME_SH" --install-cert -d "$DOMAIN" --ecc \
       --key-file       "${CERT_DIR}/privkey.key" \
       --fullchain-file "${CERT_DIR}/fullchain.pem" \
       --reloadcmd      "$reloadcmd"
     chmod 600 "${CERT_DIR}/privkey.key"; chmod 644 "${CERT_DIR}/fullchain.pem"
-    ok "Сертификат: $CERT_DIR/fullchain.pem + privkey.key (ECC, автопродление через cron acme.sh)"
+    # совместимость с Config Profile, где указан privkey.pem (или cert.pem)
+    ln -sf privkey.key "${CERT_DIR}/privkey.pem"
+    ln -sf fullchain.pem "${CERT_DIR}/cert.pem"
+    if (( rc_issue == 2 )); then
+      ok "Сертификат уже выпущен ранее — обновил файлы и reloadcmd (< 30 дней до продления acme.sh обновит сам)"
+    else
+      ok "Сертификат: $CERT_DIR/fullchain.pem + privkey.key (ECC, автопродление через cron acme.sh)"
+    fi
   else
-    warn "Сертификат не выпущен. Нода всё равно установится; выпусти позже (см. $SUMMARY_FILE)"
+    warn "Сертификат не выпущен (код acme.sh: $rc_issue). Нода всё равно установится; выпусти позже (см. $SUMMARY_FILE)"
   fi
 }
 
@@ -848,6 +829,9 @@ services:
       - '/var/log/remnanode:/var/log/remnanode'
       # Сертификаты внутри контейнера: fullchain.pem + privkey.key
       - '/opt/remnanode/certs:/var/lib/remnawave/configs/xray/ssl'
+      # Тот же каталог по короткому пути /ssl — для Config Profile,
+      # где certificateFile: /ssl/fullchain.pem (частый шаблон)
+      - '/opt/remnanode/certs:/ssl'
       # Доп. geo-файлы: монтируй ФАЙЛЫ, а не папку (иначе перекроешь штатные)
       # - './geo-custom.dat:/usr/local/share/xray/geo-custom.dat'
       # - './ip-custom.dat:/usr/local/share/xray/ip-custom.dat'
