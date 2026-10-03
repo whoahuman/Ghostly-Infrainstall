@@ -1,7 +1,34 @@
 #!/usr/bin/env bash
+# ==============================================================================
+#   ██████╗ ██╗  ██╗ ██████╗ ███████╗████████╗██╗  ██╗   ██╗   ██╗
+#  ██╔════╝ ██║  ██║██╔═══██╗██╔════╝╚══██╔══╝██║  ██║   ╚██╗ ██╔╝
+#  ██║  ███╗███████║██║   ██║███████╗   ██║   ███████║    ╚████╔╝
+#  ██║   ██║██╔══██║██║   ██║╚════██║   ██║   ██╔══██║     ╚██╔╝
+#  ╚██████╔╝██║  ██║╚██████╔╝███████║   ██║   ██║  ██║      ██║
+#   ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝   ╚═╝  ╚═╝      ╚═╝
+#
+#  Ghostly Infra-installer — установка и защита Remnawave Node
+#  Версия: 1.2.2
+#
+#  Что делает:
+#    1. Тюнинг ядра (BBR + fq, безопасные sysctl, без слепой правки conntrack)
+#    2. Firewall (nftables): NODE_PORT только для панели, анти-флуд,
+#       анти-скан, опционально строгий режим (policy DROP)
+#    3. Docker + ротация логов Docker
+#    4. Let's Encrypt (acme.sh): HTTP-01 standalone или DNS-01 Cloudflare
+#    5. Remnawave Node (docker compose) с доступом к сертификатам и логам
+#    6. Ротация логов ноды, journald
+#    7. Опционально: fail2ban (SSH), CrowdSec (анти-скан/ботнеты),
+#       харденинг SSH, сниппет анти-торрент для Config Profile
+#
+#  Запуск:  sudo bash ghostly-infra-installer.sh
+#  Справка: sudo bash ghostly-infra-installer.sh --help
+#
+#  Повторный запуск безопасен: берёт параметры из /etc/ghostly/config.env
+# ==============================================================================
 set -Eeuo pipefail
 
-readonly VERSION="1.0.3"
+readonly VERSION="1.2.2"
 readonly APP="Ghostly Infra-installer"
 
 CONFIG_DIR="/etc/ghostly"
@@ -26,6 +53,10 @@ CF_TOKEN=""
 NODE_PORT=""
 SECRET_KEY="${GHOSTLY_SECRET_KEY:-}"
 PANEL_IPS=""
+BRIDGE_PORT=""
+BRIDGE_IPS=""
+SELFSTEAL=""
+SELFSTEAL_PORT=""
 TCP_PORTS=""
 UDP_PORTS=""
 SSH_PORT=""
@@ -35,6 +66,7 @@ STRICT=""
 HARDEN_SSH=""
 FLOOD_RATE=40
 FLOOD_BURST=80
+FLOOD_ENABLE=""
 
 RECONFIGURE=0
 ASSUME_YES=0
@@ -44,6 +76,7 @@ DO_DOCKER=1
 DO_CERTS=1
 DO_NODE=1
 DO_LOGS=1
+DO_SELFSTEAL=1
 
 declare -A ARGS=()   # значения, переданные флагами (имеют приоритет над конфигом)
 
@@ -83,14 +116,20 @@ $APP v$VERSION
   --node-port <port>     NODE_PORT из карточки ноды в панели (по умолчанию 2222)
   --secret-key <key>     SECRET_KEY из карточки ноды (лучше ввести в интерактиве)
   --panel-ip <list>      IP/домены панели через запятую: кому открыт NODE_PORT
+  --bridge-port <port>   порт моста (вход для других нод), напр. 8443
+  --bridge-ip <list>     IP нод, которым разрешён порт моста (обязательно вместе
+                         с --bridge-port: иначе мост будет открыт всем)
+  --selfsteal            поднять self-steal заглушку (Caddy на 127.0.0.1:9443),
+  --no-selfsteal         чтобы REALITY отдавал свой сайт, а не чужой
   --tcp-ports <list>     TCP-порты для пользователей (по умолчанию 80,443 standalone / 443 dns)
   --udp-ports <list>     UDP-порты для пользователей (по умолчанию 443)
   --ssh-port <port>      порт SSH (определяется автоматически)
   --strict               строгий firewall: policy DROP (осторожно, спросит подтверждение)
   --harden-ssh           отключить вход по паролю и root-логин (нужен рабочий ключ!)
   --fail2ban / --no-fail2ban
+  --flood / --no-flood   анти-флуд в nftables (лимит новых соединений на IP)
   --crowdsec / --no-crowdsec
-  --skip-tuning --skip-firewall --skip-docker --skip-certs --skip-node --skip-logs
+  --skip-tuning --skip-firewall --skip-docker --skip-certs --skip-node --skip-logs --skip-selfsteal
   --reconfigure          перезапросить все параметры заново
   -y, --yes              не задавать подтверждающих вопросов
   -h, --help             эта справка
@@ -108,6 +147,10 @@ while [[ $# -gt 0 ]]; do
     --node-port)     ARGS[NODE_PORT]="${2:-}"; shift 2 ;;
     --secret-key)    ARGS[SECRET_KEY]="${2:-}"; shift 2 ;;
     --panel-ip)      ARGS[PANEL_IPS]="${2:-}"; shift 2 ;;
+    --bridge-port)   ARGS[BRIDGE_PORT]="${2:-}"; shift 2 ;;
+    --bridge-ip)     ARGS[BRIDGE_IPS]="${2:-}"; shift 2 ;;
+    --selfsteal)     ARGS[SELFSTEAL]="1"; shift ;;
+    --no-selfsteal)  ARGS[SELFSTEAL]="0"; shift ;;
     --tcp-ports)     ARGS[TCP_PORTS]="${2:-}"; shift 2 ;;
     --udp-ports)     ARGS[UDP_PORTS]="${2:-}"; shift 2 ;;
     --ssh-port)      ARGS[SSH_PORT]="${2:-}"; shift 2 ;;
@@ -117,12 +160,15 @@ while [[ $# -gt 0 ]]; do
     --no-fail2ban)   ARGS[ENABLE_FAIL2BAN]="0"; shift ;;
     --crowdsec)      ARGS[ENABLE_CROWDSEC]="1"; shift ;;
     --no-crowdsec)   ARGS[ENABLE_CROWDSEC]="0"; shift ;;
+    --flood)         ARGS[FLOOD_ENABLE]="1"; shift ;;
+    --no-flood)      ARGS[FLOOD_ENABLE]="0"; shift ;;
     --skip-tuning)   DO_TUNING=0; shift ;;
     --skip-firewall) DO_FIREWALL=0; shift ;;
     --skip-docker)   DO_DOCKER=0; shift ;;
     --skip-certs)    DO_CERTS=0; shift ;;
     --skip-node)     DO_NODE=0; shift ;;
     --skip-logs)     DO_LOGS=0; shift ;;
+    --skip-selfsteal) DO_SELFSTEAL=0; shift ;;
     --reconfigure)   RECONFIGURE=1; shift ;;
     -y|--yes)        ASSUME_YES=1; shift ;;
     -h|--help)       usage; exit 0 ;;
@@ -201,6 +247,10 @@ save_config() {
     echo "CF_TOKEN=\"$CF_TOKEN\""
     echo "NODE_PORT=\"$NODE_PORT\""
     echo "PANEL_IPS=\"$PANEL_IPS\""
+    echo "BRIDGE_PORT=\"$BRIDGE_PORT\""
+    echo "BRIDGE_IPS=\"$BRIDGE_IPS\""
+    echo "SELFSTEAL=\"$SELFSTEAL\""
+    echo "SELFSTEAL_PORT=\"$SELFSTEAL_PORT\""
     echo "TCP_PORTS=\"$TCP_PORTS\""
     echo "UDP_PORTS=\"$UDP_PORTS\""
     echo "SSH_PORT=\"$SSH_PORT\""
@@ -210,6 +260,7 @@ save_config() {
     echo "HARDEN_SSH=\"$HARDEN_SSH\""
     echo "FLOOD_RATE=\"$FLOOD_RATE\""
     echo "FLOOD_BURST=\"$FLOOD_BURST\""
+    echo "FLOOD_ENABLE=\"$FLOOD_ENABLE\""
   } >"$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
 }
@@ -260,6 +311,20 @@ collect_input() {
     [[ -z "$NODE_PORT" ]] && NODE_PORT="2222"
   fi
   ask_opt PANEL_IPS "IP или домены панели через запятую (только им будет открыт NODE_PORT; пусто = открыт всем)"
+  ask_opt BRIDGE_PORT "Порт моста для приёма трафика с других нод (пусто — мост не нужен)" ""
+  if [[ -n "$BRIDGE_PORT" ]]; then
+    ask_opt BRIDGE_IPS "IP нод, которым разрешён порт моста (через запятую; обязательно)"
+  fi
+  if [[ -z "$SELFSTEAL" ]]; then
+    if yesno "Поднять self-steal заглушку (REALITY отдаёт свой сайт на ${DOMAIN:-домене})?" y; then
+      SELFSTEAL=1
+    else
+      SELFSTEAL=0
+    fi
+  fi
+  if [[ "$SELFSTEAL" == "1" ]]; then
+    ask_opt SELFSTEAL_PORT "Порт Caddy-заглушки на loopback (REALITY будет форвардить сюда)" "9443"
+  fi
   local tcp_default
   if [[ "$ACME_METHOD" == "standalone" ]]; then tcp_default="80,443"; else tcp_default="443"; fi
   ask_opt TCP_PORTS "Открытые TCP-порты для пользователей (80 нужен для продления сертификата)" "$tcp_default"
@@ -290,6 +355,7 @@ collect_input() {
   fi
   [[ -z "$ENABLE_FAIL2BAN" ]] && ENABLE_FAIL2BAN=1
   [[ -z "$ENABLE_CROWDSEC" ]] && ENABLE_CROWDSEC=0
+  [[ -z "$FLOOD_ENABLE" ]] && FLOOD_ENABLE=1
 
   save_config
   ok "Параметры сохранены в $CONFIG_FILE (0600)"
@@ -299,7 +365,7 @@ collect_input() {
 #  ШАГ 1. Тюнинг ядра
 # ==============================================================================
 step_tuning() {
-  step "1/7 Тюнинг ядра (BBR, очереди, лимиты)"
+  step "1/8 Тюнинг ядра (BBR, очереди, лимиты)"
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates curl dnsutils logrotate cron >/dev/null
 
@@ -469,6 +535,23 @@ gen_firewall() {
     has_panel=1
   fi
 
+  # мост: вход для других нод, открыт только их адресам
+  local bridge_port="${BRIDGE_PORT:-}" bridge4="" bridge6="" has_bridge=0
+  if [[ -n "$bridge_port" && "$bridge_port" != "off" ]]; then
+    [[ "$bridge_port" =~ ^[0-9]+$ ]] || die "BRIDGE_PORT задан неверно: '${bridge_port}'"
+    [[ "$bridge_port" == "$ssh_port" ]] && die "BRIDGE_PORT совпадает с портом SSH"
+    [[ "$bridge_port" == "$node_port" ]] && die "BRIDGE_PORT совпадает с NODE_PORT"
+    for p in $(split_list "$tcp_ports") $(split_list "$udp_ports"); do
+      [[ "$p" == "$bridge_port" ]] && die "BRIDGE_PORT ($bridge_port) указан в списке пользовательских портов — убери его"
+    done
+    bridge4="$(resolve_ipv4 "${BRIDGE_IPS:-}")"
+    bridge6="$(resolve_ipv6 "${BRIDGE_IPS:-}")"
+    if [[ -z "$bridge4$bridge6" ]]; then
+      die "BRIDGE_PORT=$bridge_port задан, а BRIDGE_IPS пуст или не резолвится. Так мост будет открыт всему интернету — укажи IP нод."
+    fi
+    has_bridge=1
+  fi
+
   cat <<'NFT_HEAD'
 #!/usr/sbin/nft -f
 # Сгенерировано Ghostly Infra-installer. НЕ редактируй вручную:
@@ -480,6 +563,8 @@ NFT_HEAD
 
   emit_addr_set panel4 ipv4_addr "$panel4"
   emit_addr_set panel6 ipv6_addr "$panel6"
+  emit_addr_set bridge4 ipv4_addr "$bridge4"
+  emit_addr_set bridge6 ipv6_addr "$bridge6"
   emit_svc_set svc_tcp "$tcp_ports"
   emit_svc_set svc_udp "$udp_ports"
 
@@ -509,13 +594,30 @@ EOF
 EOF
   fi
 
+  if (( has_bridge )); then
+    cat <<EOF
+
+        # --- Мост: приём трафика с других нод (только их адреса) ---
+        ip saddr @bridge4 tcp dport ${bridge_port} accept comment "ghostly: мост — ноды v4"
+        ip6 saddr @bridge6 tcp dport ${bridge_port} accept comment "ghostly: мост — ноды v6"
+        tcp dport ${bridge_port} drop comment "ghostly: мост закрыт для остальных"
+EOF
+  fi
+
   cat <<EOF
 
-        # --- Пользовательские порты + анти-флуд (лимит новых соединений на IP) ---
+        # --- Пользовательские порты ---
+EOF
+  if [[ "${FLOOD_ENABLE:-1}" == "1" ]]; then
+    cat <<EOF
+        # анти-флуд: лимит НОВЫХ соединений на один IP (отключается FLOOD_ENABLE=0)
         tcp dport @svc_tcp ct state new meter flood_tcp4 { ip saddr limit rate over ${FLOOD_RATE:-40}/second burst ${FLOOD_BURST:-80} packets } drop comment "ghostly: anti-flood v4"
         tcp dport @svc_tcp ct state new meter flood_tcp6 { ip6 saddr limit rate over ${FLOOD_RATE:-40}/second burst ${FLOOD_BURST:-80} packets } drop comment "ghostly: anti-flood v6"
         udp dport @svc_udp ct state new meter flood_udp4 { ip saddr limit rate over 200/second burst 400 packets } drop comment "ghostly: anti-flood udp v4"
         udp dport @svc_udp ct state new meter flood_udp6 { ip6 saddr limit rate over 200/second burst 400 packets } drop comment "ghostly: anti-flood udp v6"
+EOF
+  fi
+  cat <<EOF
         tcp dport @svc_tcp accept comment "ghostly: пользовательский TCP"
         udp dport @svc_udp accept comment "ghostly: пользовательский UDP"
 
@@ -557,6 +659,12 @@ cmd_status() {
   printf 'панель:     %s\n' "${PANEL_IPS:-все адреса}"
   printf 'TCP / UDP:  %s / %s\n' "${TCP_PORTS:-—}" "${UDP_PORTS:-—}"
   printf 'SSH:        %s   strict: %s\n' "${SSH_PORT:-22}" "${STRICT:-0}"
+  if [[ -n "${BRIDGE_PORT:-}" ]]; then
+    printf 'мост:       порт %s → %s\n' "$BRIDGE_PORT" "${BRIDGE_IPS:-НЕ ОГРАНИЧЕН (плохо!)}"
+  else
+    printf 'мост:       не настроен\n'
+  fi
+  printf 'self-steal: %s\n' "$([[ "${SELFSTEAL:-0}" == "1" ]] && echo "Caddy 127.0.0.1:${SELFSTEAL_PORT}" || echo "выключен")"
   printf 'fail2ban:   %s   crowdsec: %s\n' "${ENABLE_FAIL2BAN:-0}" "${ENABLE_CROWDSEC:-0}"
   echo
   printf -- '-- firewall --\n'
@@ -584,6 +692,18 @@ cmd_status() {
     printf '  %s/fullchain.pem отсутствует\n' "$CERT_DIR"
   fi
   echo
+  printf -- '-- self-steal --\n'
+  if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -qx selfsteal; then
+    printf '  контейнер selfsteal: работает\n'
+  else
+    printf '  контейнер selfsteal: не запущен\n'
+  fi
+  if [[ -n "${DOMAIN:-}" && -n "${SELFSTEAL_PORT:-}" ]]; then
+    local sscode
+    sscode="$(curl -sk --max-time 5 --resolve "${DOMAIN}:${SELFSTEAL_PORT}:127.0.0.1" "https://${DOMAIN}:${SELFSTEAL_PORT}/" -o /dev/null -w '%{http_code}' 2>/dev/null || true)"
+    printf '  https://%s:%s/ → %s\n' "$DOMAIN" "$SELFSTEAL_PORT" "${sscode:-нет ответа}"
+  fi
+  echo
   printf -- '-- fail2ban --\n'
   if command -v fail2ban-client >/dev/null 2>&1; then
     fail2ban-client status sshd 2>/dev/null | sed 's/^/  /' || printf '  jail sshd не активен\n'
@@ -604,6 +724,31 @@ cmd_allow_panel() {
     printf 'PANEL_IPS="%s"\n' "$new" >>"$CONFIG_FILE"
   fi
   PANEL_IPS="$new"
+  apply_firewall
+}
+
+cmd_bridge() {
+  load_config
+  local port="${1:-}" ips="${2:-}"
+  if [[ "$port" == "off" ]]; then
+    sed -i 's|^BRIDGE_PORT=.*|BRIDGE_PORT=""|; s|^BRIDGE_IPS=.*|BRIDGE_IPS=""|' "$CONFIG_FILE"
+    BRIDGE_PORT=""; BRIDGE_IPS=""
+    apply_firewall
+    printf 'ghostly: правила моста убраны (порт закрыт)\n'
+    return 0
+  fi
+  [[ -n "$port" && -n "$ips" ]] || die "использование: ghostly bridge <порт> <ip|домен>[,<ip>...]   |   ghostly bridge off"
+  if grep -q '^BRIDGE_PORT=' "$CONFIG_FILE"; then
+    sed -i "s|^BRIDGE_PORT=.*|BRIDGE_PORT=\"${port}\"|" "$CONFIG_FILE"
+  else
+    printf 'BRIDGE_PORT="%s"\n' "$port" >>"$CONFIG_FILE"
+  fi
+  if grep -q '^BRIDGE_IPS=' "$CONFIG_FILE"; then
+    sed -i "s|^BRIDGE_IPS=.*|BRIDGE_IPS=\"${ips}\"|" "$CONFIG_FILE"
+  else
+    printf 'BRIDGE_IPS="%s"\n' "$ips" >>"$CONFIG_FILE"
+  fi
+  BRIDGE_PORT="$port"; BRIDGE_IPS="$ips"
   apply_firewall
 }
 
@@ -635,6 +780,8 @@ ghostly — служебная команда ноды
   ghostly status                  правила, порты, контейнер, сертификат, fail2ban
   ghostly apply-firewall          применить правила из /etc/ghostly/config.env
   ghostly allow-panel <ip|домен>  открыть панели NODE_PORT (можно список через запятую)
+  ghostly bridge <порт> <ip,ip>   открыть порт моста только указанным нодам
+  ghostly bridge off              закрыть порт моста
   ghostly panic                   снять все правила ghostly (аварийный случай)
   ghostly logs                    живые логи ноды
   ghostly renew-cert              принудительно продлить сертификат
@@ -646,6 +793,7 @@ case "${1:-}" in
   status)          cmd_status ;;
   apply-firewall)  apply_firewall ;;
   allow-panel)     shift; cmd_allow_panel "$@" ;;
+  bridge)          shift; cmd_bridge "$@" ;;
   panic)           cmd_panic ;;
   logs)            cmd_logs ;;
   renew-cert)      cmd_renew_cert ;;
@@ -659,7 +807,7 @@ GHOSTLY_CLI_EOF
 }
 
 step_firewall() {
-  step "2/7 Firewall (nftables): NODE_PORT по IP панели, анти-флуд, анти-скан"
+  step "2/8 Firewall (nftables): NODE_PORT по IP панели, анти-флуд, анти-скан"
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables >/dev/null || die "не удалось установить nftables"
   install_cli
 
@@ -669,15 +817,26 @@ step_firewall() {
     warn "Firewall НЕ применён. Причина выше. Починить и применить: ghostly apply-firewall"
   fi
 
-  if ! grep -q 'ghostly/firewall.nft' /etc/nftables.conf 2>/dev/null; then
-    if [[ -f /etc/nftables.conf ]]; then
-      printf '\ninclude "/etc/ghostly/firewall.nft"\n' >>/etc/nftables.conf
-    else
-      printf '#!/usr/sbin/nft -f\ninclude "/etc/ghostly/firewall.nft"\n' >/etc/nftables.conf
-    fi
-  fi
-  systemctl enable -q nftables >/dev/null 2>&1 || true
-  ok "Автозагрузка правил: /etc/nftables.conf включает /etc/ghostly/firewall.nft"
+  # персистентность через собственный unit: не трогаем /etc/nftables.conf,
+  # чтобы не задеть чужие таблицы (например, таблицы Remnawave Node)
+  cat >/etc/systemd/system/ghostly-firewall.service <<'EOF'
+[Unit]
+Description=Ghostly nftables firewall
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/ghostly/firewall.nft
+ExecReload=/usr/sbin/nft -f /etc/ghostly/firewall.nft
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable -q ghostly-firewall.service >/dev/null 2>&1 || true
+  ok "Автозагрузка правил: systemd unit ghostly-firewall.service (чужие nft-таблицы не затрагиваются)"
 
   if have ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
     warn "Активен ufw — дублирую разрешения, чтобы он не зарезал доступ"
@@ -699,7 +858,7 @@ step_firewall() {
 #  ШАГ 3. Docker + ротация логов Docker
 # ==============================================================================
 step_docker() {
-  step "3/7 Docker + ротация логов Docker"
+  step "3/8 Docker + ротация логов Docker"
   if have docker; then
     ok "Docker уже установлен: $(docker --version)"
   else
@@ -734,7 +893,7 @@ EOF
 #  ШАГ 4. Сертификаты Let's Encrypt (acme.sh)
 # ==============================================================================
 step_certs() {
-  step "4/7 Сертификаты Let's Encrypt (acme.sh)"
+  step "4/8 Сертификаты Let's Encrypt (acme.sh)"
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq socat openssl >/dev/null
 
   if [[ ! -x "$ACME_SH" ]]; then
@@ -756,7 +915,7 @@ step_certs() {
 
   mkdir -p "$CERT_DIR"
   local reloadcmd
-  reloadcmd="chmod 600 ${CERT_DIR}/privkey.key; chmod 644 ${CERT_DIR}/fullchain.pem; ln -sf privkey.key ${CERT_DIR}/privkey.pem; ln -sf fullchain.pem ${CERT_DIR}/cert.pem; docker restart remnanode >/dev/null 2>&1 || true"
+  reloadcmd="chmod 600 ${CERT_DIR}/privkey.key; chmod 644 ${CERT_DIR}/fullchain.pem; ln -sf privkey.key ${CERT_DIR}/privkey.pem; ln -sf fullchain.pem ${CERT_DIR}/cert.pem; docker restart remnanode >/dev/null 2>&1 || true; docker restart selfsteal >/dev/null 2>&1 || true"
 
   local rc_issue=0
   if [[ "$ACME_METHOD" == "dns_cf" ]]; then
@@ -794,10 +953,135 @@ step_certs() {
 }
 
 # ==============================================================================
-#  ШАГ 5. Remnawave Node
+#  ШАГ 5. Self-steal заглушка (Caddy на loopback)
+# ==============================================================================
+step_selfsteal() {
+  step "5/8 Self-steal заглушка для REALITY (Caddy)"
+
+  if [[ -z "${DOMAIN:-}" ]]; then
+    warn "домен не задан — пропускаю self-steal"
+    return 0
+  fi
+  if [[ ! -r "${CERT_DIR}/fullchain.pem" || ! -r "${CERT_DIR}/privkey.key" ]]; then
+    warn "нет сертификата в ${CERT_DIR} — Caddy без него не стартует. Выпусти сертификат и повтори установку (или --skip-selfsteal)."
+    return 0
+  fi
+
+  mkdir -p "${NODE_DIR}/selfsteal/www" /var/log/selfsteal
+  chmod 755 /var/log/selfsteal
+
+  # Caddy: loopback-only, PROXY protocol (Xray REALITY форвардит с xver=1)
+  cat >"${NODE_DIR}/selfsteal/Caddyfile" <<EOF
+{
+	https_port ${SELFSTEAL_PORT}
+	default_bind 127.0.0.1
+	auto_https disable_redirects
+
+	servers {
+		listener_wrappers {
+			proxy_protocol {
+				allow 127.0.0.1/32
+			}
+			tls
+		}
+	}
+
+	log {
+		output file /var/log/caddy/access.log {
+			roll_size 10MB
+			roll_keep 5
+		}
+		level ERROR
+		format json
+	}
+}
+
+# Заглушка для активного пробинга. Домен = realitySettings.serverNames у ноды.
+https://${DOMAIN} {
+	tls /certs/fullchain.pem /certs/privkey.key
+	encode gzip
+	root * /srv
+	try_files {path} /index.html
+	file_server
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000"
+	}
+}
+EOF
+
+  # Стартовая страница-заглушка. Замени своими файлами в ${NODE_DIR}/selfsteal/www/
+  cat >"${NODE_DIR}/selfsteal/www/index.html" <<'HTML'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Northwind Data Systems</title>
+<style>
+  body { margin:0; font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif; color:#12161c; background:#fbfcfe; }
+  header { border-bottom:1px solid #e4e8ee; background:#fff; }
+  .wrap { max-width:980px; margin:0 auto; padding:0 24px; }
+  nav { display:flex; align-items:center; gap:10px; height:64px; font-weight:700; }
+  .dot { width:10px; height:10px; border-radius:50%; background:#1f6feb; display:inline-block; }
+  h1 { font-size:40px; line-height:1.15; letter-spacing:-.03em; margin:64px 0 16px; }
+  p { color:#5b6673; max-width:640px; }
+</style>
+</head>
+<body>
+<header><div class="wrap"><nav><span class="dot"></span> Northwind Data Systems</nav></div></header>
+<main class="wrap">
+  <h1>Infrastructure that stays quiet.</h1>
+  <p>Мы строим и эксплуатируем распределённые системы: наблюдаемость, автоматический failover
+     и планирование мощностей для команд, которым важнее продукт, а не кластеры.</p>
+  <p>hello@example.com</p>
+</main>
+</body>
+</html>
+HTML
+
+  cat >"${NODE_DIR}/selfsteal/docker-compose.yml" <<'EOF'
+services:
+  selfsteal:
+    image: caddy:2
+    container_name: selfsteal
+    hostname: selfsteal
+    restart: always
+    network_mode: host
+    volumes:
+      - '/opt/remnanode/selfsteal/Caddyfile:/etc/caddy/Caddyfile:ro'
+      - '/opt/remnanode/selfsteal/www:/srv:ro'
+      - '/opt/remnanode/certs:/certs:ro'
+      - '/var/log/selfsteal:/var/log/caddy'
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: 3
+EOF
+
+  if have docker; then
+    ( cd "${NODE_DIR}/selfsteal" && docker compose up -d )
+    sleep 2
+    local code
+    code="$(curl -sk --max-time 10 --resolve "${DOMAIN}:${SELFSTEAL_PORT}:127.0.0.1" "https://${DOMAIN}:${SELFSTEAL_PORT}/" -o /dev/null -w '%{http_code}' || true)"
+    if [[ "$code" == "200" ]]; then
+      ok "Self-steal отвечает: https://${DOMAIN}:${SELFSTEAL_PORT}/ → 200 (только с 127.0.0.1)"
+    else
+      warn "Заглушка не ответила (код: ${code:-таймаут}). Проверь: docker logs selfsteal; сертификат должен покрывать ${DOMAIN}"
+    fi
+  else
+    warn "docker не установлен — Caddy не запущен"
+  fi
+
+  ok "В профиле RU-ноды: realitySettings.target = 127.0.0.1:${SELFSTEAL_PORT}, xver = 1, serverNames = [\"${DOMAIN}\"]"
+}
+
+# ==============================================================================
+#  ШАГ 6. Remnawave Node
 # ==============================================================================
 step_node() {
-  step "5/7 Remnawave Node (docker compose)"
+  step "6/8 Remnawave Node (docker compose)"
   mkdir -p "$NODE_DIR" "$NODE_LOG_DIR" "$CERT_DIR"
   chmod 700 "$NODE_DIR"
 
@@ -814,7 +1098,15 @@ EOF
     log "Прежний docker-compose.yml сохранён как .bak"
   fi
 
-  cat >"${NODE_DIR}/docker-compose.yml" <<'EOF'
+  # при включённой заглушке монтируем её в ноду: landing для masquerade Hysteria2
+  local www_mount=""
+  if [[ "${SELFSTEAL:-0}" == "1" ]]; then
+    www_mount="      # Заглушка для masquerade Hysteria2 (landing-страница)
+      - '${NODE_DIR}/selfsteal/www:/var/www:ro'
+"
+  fi
+
+  cat >"${NODE_DIR}/docker-compose.yml" <<EOF
 services:
   remnanode:
     container_name: remnanode
@@ -825,17 +1117,19 @@ services:
     env_file:
       - .env
     volumes:
-      # Логи Xray: путь указывается в конфиге Xray как /var/log/remnanode/*.log
+${www_mount}      # Логи Xray: путь указывается в конфиге Xray как /var/log/remnanode/*.log
       - '/var/log/remnanode:/var/log/remnanode'
       # Сертификаты внутри контейнера: fullchain.pem + privkey.key
-      - '/opt/remnanode/certs:/var/lib/remnawave/configs/xray/ssl'
+      - '${CERT_DIR}:/var/lib/remnawave/configs/xray/ssl'
       # Тот же каталог по короткому пути /ssl — для Config Profile,
       # где certificateFile: /ssl/fullchain.pem (частый шаблон)
-      - '/opt/remnanode/certs:/ssl'
+      - '${CERT_DIR}:/ssl'
       # Доп. geo-файлы: монтируй ФАЙЛЫ, а не папку (иначе перекроешь штатные)
       # - './geo-custom.dat:/usr/local/share/xray/geo-custom.dat'
       # - './ip-custom.dat:/usr/local/share/xray/ip-custom.dat'
 EOF
+      # Логи Xray: путь указывается в конфиге Xray как /var/log/remnanode/*.log
+
 
   ( cd "$NODE_DIR" && docker compose up -d )
   sleep 3
@@ -850,7 +1144,7 @@ EOF
 #  ШАГ 6. Ротация логов
 # ==============================================================================
 step_logs() {
-  step "6/7 Ротация логов (нода, journald, docker)"
+  step "7/8 Ротация логов (нода, journald, docker)"
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq logrotate >/dev/null
   mkdir -p "$NODE_LOG_DIR"
 
@@ -894,7 +1188,7 @@ EOF
 #  ШАГ 7. Дополнительная защита
 # ==============================================================================
 step_security() {
-  step "7/7 Дополнительная защита"
+  step "8/8 Дополнительная защита"
 
   if [[ "${ENABLE_FAIL2BAN:-0}" == "1" ]]; then
     if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fail2ban >/dev/null 2>&1; then
@@ -978,6 +1272,15 @@ write_summary() {
     echo "NODE_PORT:  ${NODE_PORT}"
     echo "Панель:     ${PANEL_IPS:-не ограничена}"
     echo "TCP:        ${TCP_PORTS}    UDP: ${UDP_PORTS}    SSH: ${SSH_PORT}"
+    if [[ -n "${BRIDGE_PORT:-}" ]]; then
+      echo "Мост:       порт ${BRIDGE_PORT} открыт только: ${BRIDGE_IPS}"
+    fi
+    if [[ "${SELFSTEAL:-0}" == "1" ]]; then
+      echo "Self-steal: Caddy на 127.0.0.1:${SELFSTEAL_PORT}, сайт: ${NODE_DIR}/selfsteal/www"
+      echo "            target=127.0.0.1:${SELFSTEAL_PORT}, xver=1, serverNames=[\"${DOMAIN}\"]"
+    else
+      echo "Self-steal: выключен"
+    fi
     echo "strict: ${STRICT}  fail2ban: ${ENABLE_FAIL2BAN}  crowdsec: ${ENABLE_CROWDSEC}  harden-ssh: ${HARDEN_SSH}"
     echo
     echo "Файлы:"
@@ -1028,6 +1331,7 @@ collect_input
 (( DO_FIREWALL )) && step_firewall
 (( DO_DOCKER ))   && step_docker
 (( DO_CERTS ))    && step_certs
+if (( DO_SELFSTEAL )) && [[ "${SELFSTEAL:-0}" == "1" ]]; then step_selfsteal; fi
 (( DO_NODE ))     && step_node
 (( DO_LOGS ))     && step_logs
 step_security
